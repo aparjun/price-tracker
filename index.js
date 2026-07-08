@@ -58,6 +58,15 @@ class RateLimitedError extends Error {
   }
 }
 
+// Amazon served a block/redirect/CAPTCHA page (typically from a flagged IP).
+// Transient: a later run (possibly a different IP) usually succeeds.
+class BlockedError extends Error {
+  constructor(message) {
+    super(message);
+    this.transient = true;
+  }
+}
+
 // fetch() wrapper that aborts after `ms` so a hung connection can't stall the run.
 async function fetchWithTimeout(url, options, ms) {
   const controller = new AbortController();
@@ -208,14 +217,42 @@ async function resolveFreeModels() {
   );
 }
 
+// Strip tracking/redirect params so we hit the canonical product URL
+// (less "shared-link" fingerprint, which Amazon is more likely to block).
+function cleanAmazonUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.origin + u.pathname;
+  } catch {
+    return url;
+  }
+}
+
+// Detect when Amazon returns a block/redirect/CAPTCHA interstitial instead of
+// the product page (common from flagged cloud IPs). These are transient — a
+// later run (often a different IP) usually succeeds.
+function isBlockedPage(html) {
+  const lowered = html.toLowerCase();
+  const markers = [
+    'robot check', 'captcha', 'automated access', 'make sure you are not a robot',
+    'characters you see', 'just need to make sure you', 'to discuss automated access',
+    'type the characters you see', 'unusual traffic', 'verify you are human'
+  ];
+  if (markers.some((m) => lowered.includes(m))) return true;
+  // Real Amazon product pages are very large; a tiny body means block/redirect/error.
+  if (html.length < 30000) return true;
+  return false;
+}
+
 // Fetch Amazon product page HTML (retried by caller, with UA rotation per attempt)
 async function fetchAmazonPage(url, attempt) {
   const ua = USER_AGENTS[(attempt - 1) % USER_AGENTS.length];
-  console.log(`🔍 Fetching: ${url}`);
+  const fetchUrl = cleanAmazonUrl(url);
+  console.log(`🔍 Fetching: ${fetchUrl}${fetchUrl !== url ? ` (cleaned from ${url})` : ''}`);
   console.log(`   (attempt #${attempt}, User-Agent rotation)`);
 
   const res = await fetchWithTimeout(
-    url,
+    fetchUrl,
     {
       headers: {
         'User-Agent': ua,
@@ -243,6 +280,10 @@ async function fetchAmazonPage(url, attempt) {
   const html = await res.text();
   if (!html || html.length < 500) {
     throw new FatalError('Amazon returned an empty/short body (likely a CAPTCHA or block page)');
+  }
+
+  if (isBlockedPage(html)) {
+    throw new BlockedError('Amazon served a block/redirect/CAPTCHA page (anti-bot). Will retry next run.');
   }
 
   console.log(`📄 Received HTML (${html.length} characters)`);
@@ -590,8 +631,8 @@ async function main() {
       console.log(`\n=== ${product.name} (${product.id}) ===`);
       await checkProduct(product, state, freeModelIds);
     } catch (error) {
-      if (error?.rateLimited) {
-        // Expected on the free tier; don't alarm, just skip until next run.
+      if (error?.rateLimited || error?.transient) {
+        // Expected (free-tier rate limit or Amazon anti-bot block); don't alarm.
         console.warn(`⏳ Skipping "${product.name}": ${error.message}`);
         continue;
       }
