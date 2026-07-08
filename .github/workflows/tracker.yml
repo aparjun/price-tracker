@@ -35,18 +35,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      # Install dependencies (if any)
-      - name: Install dependencies
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          elif [ -f package.json ]; then
-            npm install
-          else
-            echo "No package.json found, skipping install"
-          fi
+      # No npm dependencies (native fetch only); nothing to install.
 
       # Run price tracker
       - name: Run Price Tracker
