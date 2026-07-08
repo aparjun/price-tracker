@@ -5,18 +5,20 @@ import { dirname, join } from 'path';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// Configuration from environment variables
-const AMAZON_URL = process.env.AMAZON_URL;
+// Secrets (only these are sensitive)
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
+// Tracked data lives in the repo (not secret)
+const PRODUCTS_FILE = join(__dirname, 'products.json');
 const STATE_FILE = join(__dirname, 'state.json');
 
-// Validate required environment variables
+const HIGH_INITIAL = 999999999;
+
+// Validate required secrets
 function validateConfig() {
   const missing = [];
-  if (!AMAZON_URL) missing.push('AMAZON_URL');
   if (!OPENROUTER_API_KEY) missing.push('OPENROUTER_API_KEY');
   if (!TELEGRAM_BOT_TOKEN) missing.push('TELEGRAM_BOT_TOKEN');
   if (!TELEGRAM_CHAT_ID) missing.push('TELEGRAM_CHAT_ID');
@@ -25,25 +27,46 @@ function validateConfig() {
     console.error(`❌ Missing required environment variables: ${missing.join(', ')}`);
     process.exit(1);
   }
+}
 
-  // Validate Amazon URL format
-  if (!AMAZON_URL.includes('amazon.in') && !AMAZON_URL.includes('amazon.com')) {
-    console.error('❌ AMAZON_URL must be an Amazon India (.in) or Amazon (.com) product URL');
+// Load the list of products to track from the repo
+function readProducts() {
+  try {
+    const data = fs.readFileSync(PRODUCTS_FILE, 'utf-8');
+    const products = JSON.parse(data);
+
+    if (!Array.isArray(products) || products.length === 0) {
+      throw new Error('products.json must be a non-empty array');
+    }
+
+    for (const p of products) {
+      if (!p.id || !p.url) {
+        throw new Error('Each product must have an "id" and a "url"');
+      }
+      if (!p.url.includes('amazon.in') && !p.url.includes('amazon.com')) {
+        throw new Error(`Product "${p.id}" URL must be an Amazon India (.in) or Amazon (.com) link`);
+      }
+    }
+
+    return products;
+  } catch (error) {
+    console.error('❌ Failed to read products.json:', error.message);
     process.exit(1);
   }
 }
 
-// Read state from file
+// Read per-product state from file
 function readState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       const data = fs.readFileSync(STATE_FILE, 'utf-8');
-      return JSON.parse(data);
+      const parsed = JSON.parse(data);
+      if (parsed && parsed.products) return parsed;
     }
   } catch (error) {
-    console.warn('⚠️  Could not read state file, using defaults:', error.message);
+    console.warn('⚠️  Could not read state file, starting fresh:', error.message);
   }
-  return { lowestPrice: 999999999, productUrl: AMAZON_URL, lastChecked: null, priceHistory: [] };
+  return { products: {} };
 }
 
 // Write state to file
@@ -58,10 +81,11 @@ function writeState(state) {
 }
 
 // Fetch Amazon product page HTML
-async function fetchAmazonPage() {
-  console.log('🔍 Fetching Amazon product page...');
+async function fetchAmazonPage(url) {
+  console.log(`🔍 Fetching: ${url}`);
+  console.log('   (mimicking a real browser with a Chrome User-Agent)');
 
-  const response = await fetch(AMAZON_URL, {
+  const response = await fetch(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -86,7 +110,7 @@ async function fetchAmazonPage() {
   return html;
 }
 
-// Extract relevant HTML segment for AI parsing
+// Extract a fixed-size HTML segment for AI parsing
 function extractHtmlSegment(html) {
   const bodyStart = html.indexOf('<body');
   if (bodyStart === -1) {
@@ -146,7 +170,6 @@ ${htmlSegment}`;
     throw new Error('AI could not find price in HTML');
   }
 
-  // Clean and parse the price
   const numericPrice = parseFloat(content.replace(/[^0-9.]/g, ''));
 
   if (isNaN(numericPrice) || numericPrice <= 0) {
@@ -157,16 +180,17 @@ ${htmlSegment}`;
   return numericPrice;
 }
 
-// Send Telegram notification
-async function sendTelegramNotification(price, productUrl) {
+// Send Telegram notification for a new low
+async function sendTelegramNotification(name, price, url, previousLow) {
   console.log('📱 Sending Telegram notification...');
 
+  const prev = previousLow === HIGH_INITIAL ? '—' : `₹${previousLow.toLocaleString('en-IN')}`;
   const message = `🚨 Price Drop Alert!
 
-Product: Refrigerator (Tracked Item)
+Product: ${name}
 New All-Time Low: ₹${price.toLocaleString('en-IN')}
-Previous Low: Check tracker history
-Link: ${productUrl}
+Previous Low: ${prev}
+Link: ${url}
 
 Checked at: ${new Date().toISOString()}`;
 
@@ -197,68 +221,85 @@ Checked at: ${new Date().toISOString()}`;
   return result;
 }
 
-// Main tracking function
-async function checkPrice() {
-  console.log('🚀 Starting price check...');
-  console.log(`🔗 Product URL: ${AMAZON_URL}`);
+// Send Telegram error notification so failures are visible
+async function sendErrorNotification(name, url, error) {
+  try {
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: `⚠️ Price Tracker Error\n\nProduct: ${name}\nURL: ${url}\nError: ${error.message}\nTime: ${new Date().toISOString()}`
+      })
+    });
+  } catch (telegramError) {
+    console.error('❌ Failed to send error notification:', telegramError.message);
+  }
+}
 
+// Process a single product
+async function checkProduct(product, state) {
+  const ps = state.products[product.id] || {
+    lowestPrice: HIGH_INITIAL,
+    lastChecked: null,
+    priceHistory: []
+  };
+
+  const previousLow = ps.lowestPrice;
+
+  const html = await fetchAmazonPage(product.url);
+  const htmlSegment = extractHtmlSegment(html);
+  const currentPrice = await parsePriceWithAI(htmlSegment);
+
+  const now = new Date().toISOString();
+  ps.lastChecked = now;
+  ps.priceHistory.push({ timestamp: now, price: currentPrice });
+
+  // Keep only last 100 history entries
+  if (ps.priceHistory.length > 100) {
+    ps.priceHistory = ps.priceHistory.slice(-100);
+  }
+
+  if (currentPrice < previousLow) {
+    console.log(`🎉 NEW ALL-TIME LOW for "${product.name}"! ₹${currentPrice.toLocaleString('en-IN')} < ₹${previousLow === HIGH_INITIAL ? '∞' : previousLow.toLocaleString('en-IN')}`);
+    ps.lowestPrice = currentPrice;
+    await sendTelegramNotification(product.name, currentPrice, product.url, previousLow);
+  } else {
+    console.log(`📈 No new low for "${product.name}". Current: ₹${currentPrice.toLocaleString('en-IN')}, Lowest: ₹${previousLow === HIGH_INITIAL ? '∞' : previousLow.toLocaleString('en-IN')}`);
+  }
+
+  state.products[product.id] = ps;
+}
+
+// Main entry point
+async function main() {
+  console.log('🚀 Starting price tracker...');
   validateConfig();
 
+  const products = readProducts();
+  console.log(`📦 Tracking ${products.length} product(s)`);
+
   const state = readState();
-  console.log(`📊 Current lowest price in state: ₹${state.lowestPrice === 999999999 ? 'Not set' : state.lowestPrice.toLocaleString('en-IN')}`);
 
-  try {
-    // Fetch and parse
-    const html = await fetchAmazonPage();
-    const htmlSegment = extractHtmlSegment(html);
-    const currentPrice = await parsePriceWithAI(htmlSegment);
-
-    // Update state with current check
-    const now = new Date().toISOString();
-    state.lastChecked = now;
-    state.productUrl = AMAZON_URL;
-    state.priceHistory.push({ timestamp: now, price: currentPrice });
-
-    // Keep only last 100 history entries
-    if (state.priceHistory.length > 100) {
-      state.priceHistory = state.priceHistory.slice(-100);
-    }
-
-    // Check for new low
-    if (currentPrice < state.lowestPrice) {
-      console.log(`🎉 NEW ALL-TIME LOW! ₹${currentPrice.toLocaleString('en-IN')} < ₹${state.lowestPrice === 999999999 ? '∞' : state.lowestPrice.toLocaleString('en-IN')}`);
-
-      state.lowestPrice = currentPrice;
-      writeState(state);
-
-      await sendTelegramNotification(currentPrice, AMAZON_URL);
-    } else {
-      console.log(`📈 No new low. Current: ₹${currentPrice.toLocaleString('en-IN')}, Lowest: ₹${state.lowestPrice.toLocaleString('en-IN')}`);
-      writeState(state);
-    }
-
-    console.log('✅ Price check completed successfully');
-
-  } catch (error) {
-    console.error('❌ Price check failed:', error.message);
-
-    // Send error notification to Telegram (optional, but helpful for debugging)
+  let failures = 0;
+  for (const product of products) {
     try {
-      await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: TELEGRAM_CHAT_ID,
-          text: `⚠️ Price Tracker Error\n\n${error.message}\n\nProduct: ${AMAZON_URL}\nTime: ${new Date().toISOString()}`
-        })
-      });
-    } catch (telegramError) {
-      console.error('❌ Failed to send error notification:', telegramError.message);
+      console.log(`\n=== ${product.name} (${product.id}) ===`);
+      await checkProduct(product, state);
+    } catch (error) {
+      failures++;
+      console.error(`❌ Failed to check "${product.name}":`, error.message);
+      await sendErrorNotification(product.name, product.url, error);
     }
+  }
 
+  writeState(state);
+
+  console.log('\n✅ Price tracker run completed');
+  if (failures > 0) {
+    console.error(`⚠️  ${failures} product(s) failed to check`);
     process.exit(1);
   }
 }
 
-// Run the tracker
-checkPrice();
+main();

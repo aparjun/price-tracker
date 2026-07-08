@@ -69,33 +69,62 @@ Node.js Script (index.js)
    git push -u origin main
    ```
 
-### 4. Configure GitHub Secrets
+### 4. Add Products to Track
+
+Product URLs are **not** secrets — they are public links, kept in `products.json`
+in the repository so you can add or remove products by editing the file.
+
+`products.json` format:
+
+```json
+[
+  {
+    "id": "samsung-253l",
+    "name": "Samsung 253L Frost Free Double Door Refrigerator",
+    "url": "https://www.amazon.in/dp/B0XXXXXXXX"
+  },
+  {
+    "id": "lg-260l",
+    "name": "LG 260L Smart Inverter Refrigerator",
+    "url": "https://www.amazon.in/dp/B0YYYYYYYY"
+  }
+]
+```
+
+- `id` — unique short key (used in `state.json`); change it if you swap the model
+- `name` — human-readable label shown in Telegram alerts
+- `url` — the full Amazon India (`.in`) or Amazon (`.com`) product link
+
+To add a product: append an entry and commit (or open a PR). The next scheduled
+run picks it up automatically. Per-product all-time lows are stored in
+`state.json` under `products.<id>`.
+
+### 5. Configure GitHub Secrets
 
 Go to your repository: **Settings → Secrets and variables → Actions → New repository secret**
 
-Add these **4 secrets**:
+Add these **3 secrets** (product URLs are NOT secrets):
 
 | Secret Name | Value | Description |
 |-------------|-------|-------------|
-| `AMAZON_URL` | `https://www.amazon.in/dp/B0XXXXXXXX` | Full Amazon India product URL |
 | `OPENROUTER_API_KEY` | `sk-or-v1-xxxxxxxxxxxxx` | Your OpenRouter API key |
 | `TELEGRAM_BOT_TOKEN` | `123456789:ABCdefGHIjklMNOpqrSTUvwxyz` | From BotFather |
 | `TELEGRAM_CHAT_ID` | `123456789` | Your numeric chat ID |
 
-### 5. Enable GitHub Actions
+### 6. Enable GitHub Actions
 
 1. Go to **Actions** tab in your repository
 2. Click "I understand my workflows, go ahead and enable them"
 3. The workflow will run automatically every 4 hours
 4. You can also trigger manually from Actions tab → "Run workflow"
 
-### 6. Test the Setup
+### 7. Test the Setup
 
 1. Go to **Actions** tab
 2. Select "Amazon Price Tracker" workflow
 3. Click "Run workflow" → "Run workflow"
 4. Check the run logs for success
-5. Check Telegram for notification (if price is lower than initial state)
+5. Check Telegram for notification (the first run reports a new low, since the initial all-time low is effectively infinite)
 
 ## Customization
 
@@ -111,7 +140,9 @@ on:
 
 ### Track Multiple Products
 
-Create separate workflow files or modify `index.js` to accept multiple URLs via environment variables.
+Multiple products are supported out of the box. Just add more entries to
+`products.json` (each with a unique `id`). The script checks every product on
+each run and tracks a separate all-time low per `id` in `state.json`.
 
 ### Add Price History Report
 
