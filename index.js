@@ -19,11 +19,11 @@ const HIGH_INITIAL = 999999999;
 // suffix and has ZERO prompt/completion pricing, so they never consume credits.
 // The live resolver below verifies pricing before any call.
 const PREFERRED_FREE_MODELS = [
-  'google/gemini-flash-1.5-free',
-  'meta-llama/llama-3.2-3b-instruct:free',
-  'microsoft/phi-3-mini-128k-instruct:free',
-  'google/gemma-2-9b-it:free',
-  'qwen/qwen3-32b:free'
+  'google/gemma-4-26b-a4b-it:free',
+  'meta-llama/llama-3.3-70b-instruct:free',
+  'qwen/qwen3-coder:free',
+  'openai/gpt-oss-20b:free',
+  'google/gemma-4-31b-it:free'
 ];
 
 // A few realistic User-Agents, rotated on retries to reduce Amazon blocking.
@@ -42,6 +42,14 @@ class FatalError extends Error {
   constructor(message) {
     super(message);
     this.fatal = true;
+  }
+}
+
+// Rate-limit (429) on the free tier: account-wide, won't clear mid-run.
+class RateLimitedError extends Error {
+  constructor(message) {
+    super(message);
+    this.rateLimited = true;
   }
 }
 
@@ -102,8 +110,8 @@ function readProducts() {
     const data = fs.readFileSync(PRODUCTS_FILE, 'utf-8');
     const products = JSON.parse(data);
 
-    if (!Array.isArray(products) || products.length === 0) {
-      throw new Error('products.json must be a non-empty array');
+    if (!Array.isArray(products)) {
+      throw new Error('products.json must be a JSON array');
     }
 
     for (const p of products) {
@@ -291,7 +299,8 @@ ${htmlSegment}`;
   );
 
   if (!res.ok) {
-    if (res.status === 429 || res.status >= 500) throw new Error(`OpenRouter HTTP ${res.status}`);
+    if (res.status === 429) throw new RateLimitedError(`OpenRouter HTTP 429 (rate limit) on ${modelId}`);
+    if (res.status >= 500) throw new Error(`OpenRouter HTTP ${res.status} (transient)`);
     throw new FatalError(`OpenRouter HTTP ${res.status}: ${res.statusText}`);
   }
 
@@ -317,19 +326,27 @@ ${htmlSegment}`;
 }
 
 // Try each free model in order; fall back to the next on any failure.
+// Try only the first few free models (never all 24 — cascading burns the
+// free-tier rate limit and triggers mass 429s). Stop immediately on a
+// rate-limit (429) since it's account-wide and won't clear mid-run.
 async function parsePriceWithFallback(htmlSegment, freeModelIds) {
+  const candidates = freeModelIds.slice(0, 3);
   let lastError;
-  for (const modelId of freeModelIds) {
+  for (const modelId of candidates) {
     try {
       const price = await withRetry(
         () => callModel(modelId, htmlSegment),
-        { retries: 2, baseDelayMs: 2000, label: `AI parse (${modelId})`, isRetryable: (e) => !e?.fatal }
+        { retries: 2, baseDelayMs: 1500, label: `AI parse (${modelId})`, isRetryable: (e) => !e?.fatal && !e?.rateLimited }
       );
       console.log(`💡 Used model ${modelId}`);
       return price;
     } catch (err) {
+      if (err?.rateLimited) {
+        throw new RateLimitedError('OpenRouter free tier rate-limited. Will retry next scheduled run.');
+      }
       lastError = err;
-      console.warn(`⚠️  Model ${modelId} failed: ${err.message}; trying next free model`);
+      const reason = err?.fatal ? 'could not parse price' : 'failed (transient)';
+      console.warn(`⚠️  Model ${modelId} ${reason}; trying next model`);
     }
   }
   throw lastError ?? new FatalError('All free models failed to parse price');
@@ -466,6 +483,11 @@ async function main() {
       console.log(`\n=== ${product.name} (${product.id}) ===`);
       await checkProduct(product, state, freeModelIds);
     } catch (error) {
+      if (error?.rateLimited) {
+        // Expected on the free tier; don't alarm, just skip until next run.
+        console.warn(`⏳ Skipping "${product.name}": ${error.message}`);
+        continue;
+      }
       failures++;
       console.error(`❌ Failed to check "${product.name}":`, error.message);
       await sendErrorNotification(product.name, product.url, error);
