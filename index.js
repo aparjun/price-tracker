@@ -13,8 +13,75 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 // Tracked data lives in the repo (not secret)
 const PRODUCTS_FILE = join(__dirname, 'products.json');
 const STATE_FILE = join(__dirname, 'state.json');
-
 const HIGH_INITIAL = 999999999;
+
+// Ordered preference of free models. Every entry carries OpenRouter's ":free"
+// suffix and has ZERO prompt/completion pricing, so they never consume credits.
+// The live resolver below verifies pricing before any call.
+const PREFERRED_FREE_MODELS = [
+  'google/gemini-flash-1.5-free',
+  'meta-llama/llama-3.2-3b-instruct:free',
+  'microsoft/phi-3-mini-128k-instruct:free',
+  'google/gemma-2-9b-it:free',
+  'qwen/qwen3-32b:free'
+];
+
+// A few realistic User-Agents, rotated on retries to reduce Amazon blocking.
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0',
+  'Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0'
+];
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Errors marked .fatal are NOT retried (e.g. parse failures, removed product).
+class FatalError extends Error {
+  constructor(message) {
+    super(message);
+    this.fatal = true;
+  }
+}
+
+// fetch() wrapper that aborts after `ms` so a hung connection can't stall the run.
+async function fetchWithTimeout(url, options, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Generic retry with exponential backoff + jitter.
+// `isRetryable(err)` decides whether to retry; fatal errors short-circuit.
+async function withRetry(
+  fn,
+  { retries = 3, baseDelayMs = 2000, factor = 2, isRetryable = () => true, label = 'operation' } = {}
+) {
+  let lastError;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn(attempt);
+    } catch (err) {
+      lastError = err;
+      if (err?.fatal || !isRetryable(err)) {
+        console.warn(`⚠️  ${label} failed (non-retryable): ${err.message}`);
+        throw err;
+      }
+      const isLast = attempt === retries;
+      console.warn(`⚠️  ${label} failed (attempt ${attempt}/${retries}): ${err.message}`);
+      if (isLast) break;
+      const delay = Math.min(baseDelayMs * Math.pow(factor, attempt - 1), 30000) + Math.random() * 500;
+      console.log(`   retrying in ${Math.round(delay)}ms...`);
+      await sleep(delay);
+    }
+  }
+  throw lastError;
+}
 
 // Validate required secrets
 function validateConfig() {
@@ -69,43 +136,102 @@ function readState() {
   return { products: {} };
 }
 
-// Write state to file
+// Write state to file (with a couple of retries)
 function writeState(state) {
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-    console.log('✅ State updated and saved');
-  } catch (error) {
-    console.error('❌ Failed to write state file:', error.message);
-    throw error;
-  }
+  return withRetry(
+    () => {
+      fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+      console.log('✅ State updated and saved');
+    },
+    { retries: 3, baseDelayMs: 500, label: 'write state' }
+  );
 }
 
-// Fetch Amazon product page HTML
-async function fetchAmazonPage(url) {
+// Resolve which free models are actually available, verified against OpenRouter's
+// own pricing metadata so we NEVER call a model that would consume credits.
+async function resolveFreeModels() {
+  return withRetry(
+    async () => {
+      const res = await fetchWithTimeout(
+        'https://openrouter.ai/api/v1/models',
+        {
+          headers: {
+            Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+            'HTTP-Referer': 'https://github.com',
+            'X-Title': 'Amazon Price Tracker'
+          }
+        },
+        15000
+      );
+      if (!res.ok) throw new Error(`models list HTTP ${res.status}`);
+
+      const data = await res.json();
+      const models = Array.isArray(data?.data) ? data.data : [];
+
+      const free = models
+        .filter((m) => {
+          const p = m?.pricing;
+          const zeroPricing = p && p.prompt === '0' && p.completion === '0';
+          return zeroPricing && typeof m.id === 'string' && m.id.endsWith(':free');
+        })
+        .map((m) => m.id);
+
+      if (free.length === 0) {
+        // Could not confirm any free model via API. Fall back to our curated
+        // :free list (these IDs are OpenRouter's reserved free-model names).
+        console.warn('⚠️  No free models confirmed via API; using curated :free list (still zero-cost).');
+        return PREFERRED_FREE_MODELS.slice();
+      }
+
+      // Honour our preferred order, then append any other verified-free models.
+      const ordered = [
+        ...PREFERRED_FREE_MODELS.filter((id) => free.includes(id)),
+        ...free.filter((id) => !PREFERRED_FREE_MODELS.includes(id))
+      ];
+      console.log(`🆓 Free models available (${ordered.length}): ${ordered.join(', ')}`);
+      return ordered;
+    },
+    { retries: 3, baseDelayMs: 1500, label: 'resolve free models' }
+  );
+}
+
+// Fetch Amazon product page HTML (retried by caller, with UA rotation per attempt)
+async function fetchAmazonPage(url, attempt) {
+  const ua = USER_AGENTS[(attempt - 1) % USER_AGENTS.length];
   console.log(`🔍 Fetching: ${url}`);
-  console.log('   (mimicking a real browser with a Chrome User-Agent)');
+  console.log(`   (attempt #${attempt}, User-Agent rotation)`);
 
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Connection': 'keep-alive',
-      'Upgrade-Insecure-Requests': '1',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': 'none',
-      'Sec-Fetch-User': '?1',
-      'Cache-Control': 'max-age=0'
-    }
-  });
+  const res = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        'User-Agent': ua,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0'
+      }
+    },
+    30000
+  );
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+  // 404 = product gone -> fatal (no point retrying). Others may be transient blocks.
+  if (!res.ok) {
+    if (res.status === 404) throw new FatalError(`Amazon returned 404 for ${url} (product likely removed)`);
+    throw new Error(`HTTP ${res.status}: ${res.statusText}`); // 403/429/5xx -> retryable
   }
 
-  const html = await response.text();
+  const html = await res.text();
+  if (!html || html.length < 500) {
+    throw new FatalError('Amazon returned an empty/short body (likely a CAPTCHA or block page)');
+  }
+
   console.log(`📄 Received HTML (${html.length} characters)`);
   return html;
 }
@@ -122,9 +248,14 @@ function extractHtmlSegment(html) {
   return segment;
 }
 
-// Parse price using OpenRouter AI
-async function parsePriceWithAI(htmlSegment) {
-  console.log('🤖 Sending HTML to OpenRouter AI for price extraction...');
+// Call a single (verified-free) model to extract the price.
+async function callModel(modelId, htmlSegment) {
+  // Defense-in-depth: never call a model that isn't explicitly free.
+  if (!modelId.endsWith(':free')) {
+    throw new FatalError(`Refusing to call non-free model "${modelId}" (would consume credits)`);
+  }
+
+  console.log(`🤖 Parsing price with ${modelId}...`);
 
   const prompt = `Extract the current selling price in INR (Indian Rupees) from this Amazon product page HTML snippet.
 
@@ -139,51 +270,102 @@ Rules:
 HTML:
 ${htmlSegment}`;
 
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': 'https://github.com',
-      'X-Title': 'Amazon Price Tracker'
+  const res = await fetchWithTimeout(
+    'https://openrouter.ai/api/v1/chat/completions',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://github.com',
+        'X-Title': 'Amazon Price Tracker'
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 50,
+        temperature: 0
+      })
     },
-    body: JSON.stringify({
-      model: 'google/gemini-flash-1.5-free',
-      messages: [
-        { role: 'user', content: prompt }
-      ],
-      max_tokens: 50,
-      temperature: 0
-    })
-  });
+    60000
+  );
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
+  if (!res.ok) {
+    if (res.status === 429 || res.status >= 500) throw new Error(`OpenRouter HTTP ${res.status}`);
+    throw new FatalError(`OpenRouter HTTP ${res.status}: ${res.statusText}`);
   }
 
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content?.trim() || '';
+  const data = await res.json();
+  if (data?.error) {
+    throw new Error(`OpenRouter error: ${data.error.message || JSON.stringify(data.error)}`);
+  }
+
+  const content = data?.choices?.[0]?.message?.content?.trim() || '';
   console.log(`🤖 AI Response: "${content}"`);
 
   if (content === 'NOT_FOUND' || !content) {
-    throw new Error('AI could not find price in HTML');
+    throw new FatalError('AI could not find price in HTML'); // try next model
   }
 
   const numericPrice = parseFloat(content.replace(/[^0-9.]/g, ''));
-
   if (isNaN(numericPrice) || numericPrice <= 0) {
-    throw new Error(`Invalid price extracted: ${content}`);
+    throw new FatalError(`Invalid price extracted: ${content}`); // try next model
   }
 
   console.log(`💰 Parsed price: ₹${numericPrice.toLocaleString('en-IN')}`);
   return numericPrice;
 }
 
-// Send Telegram notification for a new low
+// Try each free model in order; fall back to the next on any failure.
+async function parsePriceWithFallback(htmlSegment, freeModelIds) {
+  let lastError;
+  for (const modelId of freeModelIds) {
+    try {
+      const price = await withRetry(
+        () => callModel(modelId, htmlSegment),
+        { retries: 2, baseDelayMs: 2000, label: `AI parse (${modelId})`, isRetryable: (e) => !e?.fatal }
+      );
+      console.log(`💡 Used model ${modelId}`);
+      return price;
+    } catch (err) {
+      lastError = err;
+      console.warn(`⚠️  Model ${modelId} failed: ${err.message}; trying next free model`);
+    }
+  }
+  throw lastError ?? new FatalError('All free models failed to parse price');
+}
+
+// Send a Telegram message (throws on failure so the caller can retry).
+async function sendTelegramMessage(text) {
+  const res = await fetchWithTimeout(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        disable_web_page_preview: false
+      })
+    },
+    15000
+  );
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`Telegram HTTP ${res.status} - ${errorText}`);
+  }
+
+  const result = await res.json();
+  if (!result.ok) {
+    throw new Error(`Telegram API error: ${result.description}`);
+  }
+
+  return result;
+}
+
 async function sendTelegramNotification(name, price, url, previousLow) {
   console.log('📱 Sending Telegram notification...');
-
   const prev = previousLow === HIGH_INITIAL ? '—' : `₹${previousLow.toLocaleString('en-IN')}`;
   const message = `🚨 Price Drop Alert!
 
@@ -194,72 +376,60 @@ Link: ${url}
 
 Checked at: ${new Date().toISOString()}`;
 
-  const response = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message,
-        disable_web_page_preview: false
-      })
-    }
+  await withRetry(
+    () => sendTelegramMessage(message),
+    { retries: 3, baseDelayMs: 2000, label: 'Telegram alert' }
   );
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Telegram API error: ${response.status} - ${errorText}`);
-  }
-
-  const result = await response.json();
-  if (!result.ok) {
-    throw new Error(`Telegram API error: ${result.description}`);
-  }
-
   console.log('✅ Telegram notification sent successfully');
-  return result;
 }
 
-// Send Telegram error notification so failures are visible
+// Best-effort error alert — reported but never blocks the run.
 async function sendErrorNotification(name, url, error) {
+  const message = `⚠️ Price Tracker Error
+
+Product: ${name}
+URL: ${url}
+Error: ${error.message}
+Time: ${new Date().toISOString()}`;
+
   try {
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: `⚠️ Price Tracker Error\n\nProduct: ${name}\nURL: ${url}\nError: ${error.message}\nTime: ${new Date().toISOString()}`
-      })
-    });
+    await withRetry(
+      () => sendTelegramMessage(message),
+      { retries: 2, baseDelayMs: 1500, label: 'Telegram error alert' }
+    );
   } catch (telegramError) {
     console.error('❌ Failed to send error notification:', telegramError.message);
   }
 }
 
-// Process a single product
-async function checkProduct(product, state) {
+// Process a single product end-to-end with retries + fallbacks at each step.
+async function checkProduct(product, state, freeModelIds) {
   const ps = state.products[product.id] || {
     lowestPrice: HIGH_INITIAL,
     lastChecked: null,
     priceHistory: []
   };
-
   const previousLow = ps.lowestPrice;
 
-  const html = await fetchAmazonPage(product.url);
-  const htmlSegment = extractHtmlSegment(html);
-  const currentPrice = await parsePriceWithAI(htmlSegment);
+  // Step 1: fetch Amazon page (retries + UA rotation)
+  const html = await withRetry(
+    (attempt) => fetchAmazonPage(product.url, attempt),
+    { retries: 3, baseDelayMs: 3000, factor: 2, label: 'fetch Amazon', isRetryable: (e) => !e?.fatal }
+  );
 
+  // Step 2: extract + parse price (model fallback across free models)
+  const htmlSegment = extractHtmlSegment(html);
+  const currentPrice = await parsePriceWithFallback(htmlSegment, freeModelIds);
+
+  // Step 3: update state
   const now = new Date().toISOString();
   ps.lastChecked = now;
   ps.priceHistory.push({ timestamp: now, price: currentPrice });
-
-  // Keep only last 100 history entries
   if (ps.priceHistory.length > 100) {
     ps.priceHistory = ps.priceHistory.slice(-100);
   }
 
+  // Step 4: notify on new low
   if (currentPrice < previousLow) {
     console.log(`🎉 NEW ALL-TIME LOW for "${product.name}"! ₹${currentPrice.toLocaleString('en-IN')} < ₹${previousLow === HIGH_INITIAL ? '∞' : previousLow.toLocaleString('en-IN')}`);
     ps.lowestPrice = currentPrice;
@@ -281,11 +451,20 @@ async function main() {
 
   const state = readState();
 
+  // Resolve the list of zero-cost models once for the whole run.
+  let freeModelIds;
+  try {
+    freeModelIds = await resolveFreeModels();
+  } catch (err) {
+    console.warn('⚠️  Free-model verification failed:', err.message, '— using curated :free list as fallback.');
+    freeModelIds = PREFERRED_FREE_MODELS.slice();
+  }
+
   let failures = 0;
   for (const product of products) {
     try {
       console.log(`\n=== ${product.name} (${product.id}) ===`);
-      await checkProduct(product, state);
+      await checkProduct(product, state, freeModelIds);
     } catch (error) {
       failures++;
       console.error(`❌ Failed to check "${product.name}":`, error.message);
@@ -293,7 +472,7 @@ async function main() {
     }
   }
 
-  writeState(state);
+  await writeState(state);
 
   console.log('\n✅ Price tracker run completed');
   if (failures > 0) {

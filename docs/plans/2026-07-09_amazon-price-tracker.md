@@ -689,3 +689,9 @@ After implementation, verify:
 8. **Cron schedule** - exactly `0 */4 * * *` (every 4 hours at minute 0)
 9. **HTML segment** - exactly 15000 characters from `<body` tag
 10. **Telegram message format** - match the specified format with emoji and locale formatting
+
+## Addendum (2026-07-09 revisions)
+
+- Product URLs moved out of secrets into a committed `products.json` (they are public, not sensitive). Only 3 secrets remain: `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+- **Free-model enforcement**: before any AI call, resolve models via OpenRouter `/models`, keep only those with `pricing.prompt === "0"` AND `pricing.completion === "0"` AND id ending in `:free`. Fall back to a curated `:free` list if the API is unreachable. A guard refuses to call any non-`:free` model so credits are never consumed.
+- **Resilience**: every external step has retry-with-backoff plus fallback — Amazon fetch rotates User-Agents and treats 404 as fatal; AI parse retries each model 2x then falls back to the next free model; Telegram alerts retry 3x; state write retries 3x. All calls have timeouts. A single product failure alerts and continues; the run only fails if all products fail.

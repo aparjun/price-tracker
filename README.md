@@ -5,11 +5,36 @@ Automated price tracking for Amazon India products using GitHub Actions, AI-powe
 ## Features
 
 - 🔄 **Automated checks every 4 hours** via GitHub Actions scheduled workflow
-- 🤖 **AI-powered price extraction** using OpenRouter (Google Gemini Flash 1.5 Free) - resilient to Amazon HTML changes
+- 🤖 **AI-powered price extraction** using OpenRouter, resilient to Amazon HTML changes
+- 🆓 **Zero credits**: only verified zero-cost `:free` models are ever used
 - 📱 **Instant Telegram notifications** when new all-time low price detected
 - 💾 **Persistent state** stored in repository (commits `state.json` automatically)
-- 🆓 **Completely free** - uses only free tiers of all services
+- 🔁 **Resilient**: retries with backoff + per-model fallback at every external step
 - 🛡️ **Secure** - all secrets stored in GitHub repository secrets
+
+## Resilience & Free-Model Guarantee
+
+**Only free models, never your credits.** Before any AI call, the script queries
+OpenRouter's `/models` endpoint and keeps only models whose `pricing.prompt` and
+`pricing.completion` are both `"0"` **and** whose id ends with `:free`. If the
+live check is unavailable, it falls back to a curated list of `:free` model IDs
+(each carries the `:free` suffix OpenRouter reserves for zero-cost models). A
+final defense-in-depth guard refuses to call any model that does not end with
+`:free`, so a paid model can never be invoked by accident.
+
+**Retry + fallback at every step:**
+
+| Step | Retry / Fallback strategy |
+|------|---------------------------|
+| Resolve free models | Retry up to 3x; on total failure, fall back to curated `:free` list |
+| Fetch Amazon page | Retry up to 3x with exponential backoff; **rotates User-Agent** each attempt; 404 treated as fatal (no retry) |
+| Parse price (AI) | Retry each model 2x; on exhaustion, **fall back to the next free model**; parse failures move on to the next model immediately |
+| Telegram alert | Retry up to 3x; failures also reported via error alert |
+| Write state | Retry up to 3x |
+
+All external calls use a timeout (Amazon 30s, OpenRouter 60s, Telegram 15s) so a
+hung connection can't stall the run. A failure on one product alerts you and
+continues with the next — the whole run only exits non-zero if every product failed.
 
 ## Architecture
 
