@@ -249,16 +249,50 @@ async function fetchAmazonPage(url, attempt) {
   return html;
 }
 
-// Extract a fixed-size HTML segment for AI parsing
-function extractHtmlSegment(html) {
-  const bodyStart = html.indexOf('<body');
-  if (bodyStart === -1) {
-    console.warn('⚠️  No <body> tag found, using first 15000 chars');
-    return html.substring(0, 15000);
+// Extract price-context windows from the (often huge) Amazon HTML instead of a
+// fixed prefix. Amazon pages are 100s of KB; the price usually sits far below
+// the <body> opening, so a 15k prefix misses it. We locate price-related text
+// and pull a window around each hit, capped to keep token usage sane.
+function extractHtmlSegments(html) {
+  const MAX_TOTAL = 50000;
+  const WIN = 4000;
+
+  const keywords = ['₹', 'Rs.', 'INR', 'a-price', 'data-price', 'priceblock', 'buyingPrice', '"price"', 'priceCurrency', 'dealPrice'];
+  const hits = [];
+  for (const kw of keywords) {
+    let idx = html.indexOf(kw);
+    while (idx !== -1 && hits.length < 40) {
+      hits.push(idx);
+      idx = html.indexOf(kw, idx + 1);
+    }
   }
-  const segment = html.substring(bodyStart, bodyStart + 15000);
-  console.log(`📝 Extracted HTML segment (${segment.length} characters)`);
-  return segment;
+
+  const seen = new Set();
+  const windows = [];
+  let total = 0;
+  for (const pos of hits) {
+    const start = Math.max(0, pos - Math.floor(WIN / 2));
+    const end = Math.min(html.length, pos + Math.floor(WIN / 2));
+    const key = Math.floor(start / 2000); // dedupe by coarse region
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const seg = html.substring(start, end);
+    if (total + seg.length > MAX_TOTAL) break;
+    windows.push(seg);
+    total += seg.length;
+  }
+
+  if (windows.length > 0) {
+    const combined = windows.join('\n\n---SNIP---\n\n');
+    console.log(`📝 Extracted ${windows.length} price-context window(s) (${combined.length} characters)`);
+    return combined;
+  }
+
+  // Fallback: large prefix of the body
+  const bodyStart = html.indexOf('<body');
+  const fallback = bodyStart === -1 ? html.substring(0, MAX_TOTAL) : html.substring(bodyStart, bodyStart + MAX_TOTAL);
+  console.log(`📝 Extracted HTML segment (${fallback.length} characters)`);
+  return fallback;
 }
 
 // Shared prompt: ask the model for the current INR selling price only.
@@ -508,7 +542,7 @@ async function checkProduct(product, state, freeModelIds) {
   );
 
   // Step 2: extract + parse price (model fallback across free models)
-  const htmlSegment = extractHtmlSegment(html);
+  const htmlSegment = extractHtmlSegments(html);
   const currentPrice = await parsePriceWithFallback(htmlSegment, freeModelIds);
 
   // Step 3: update state
