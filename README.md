@@ -1,0 +1,152 @@
+# Amazon India Price Tracker
+
+Automated price tracking for Amazon India products using GitHub Actions, AI-powered HTML parsing, and Telegram notifications.
+
+## Features
+
+- 🔄 **Automated checks every 4 hours** via GitHub Actions scheduled workflow
+- 🤖 **AI-powered price extraction** using OpenRouter (Google Gemini Flash 1.5 Free) - resilient to Amazon HTML changes
+- 📱 **Instant Telegram notifications** when new all-time low price detected
+- 💾 **Persistent state** stored in repository (commits `state.json` automatically)
+- 🆓 **Completely free** - uses only free tiers of all services
+- 🛡️ **Secure** - all secrets stored in GitHub repository secrets
+
+## Architecture
+
+```
+GitHub Actions (cron every 4h)
+       │
+       ▼
+Node.js Script (index.js)
+       │
+       ├───▶ Fetch Amazon HTML (with browser-like headers)
+       │
+       ├───▶ Send HTML segment to OpenRouter AI
+       │         └──▶ Returns numeric price
+       │
+       ├───▶ Compare with state.json lowestPrice
+       │
+       ├───▶ If new low: Update state.json + Send Telegram
+       │
+       └───▶ Commit & push state.json to repo
+```
+
+## Prerequisites
+
+1. **GitHub Account** - For repository and Actions
+2. **OpenRouter Account** - Free API key at [openrouter.ai](https://openrouter.ai)
+3. **Telegram Account** - For bot and notifications
+
+## Setup Instructions
+
+### 1. Create Telegram Bot
+
+1. Open Telegram and search for `@BotFather`
+2. Send `/newbot` and follow prompts
+3. Save the **Bot Token** (format: `123456789:ABCdefGHIjklMNOpqrSTUvwxyz`)
+4. Message your new bot to start a chat
+5. Get your **Chat ID**:
+   - Visit: `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
+   - Look for `"chat":{"id":123456789,...}` - that number is your Chat ID
+
+### 2. Get OpenRouter API Key
+
+1. Sign up at [openrouter.ai](https://openrouter.ai)
+2. Go to [Keys](https://openrouter.ai/keys)
+3. Create a new API key
+4. The free tier includes `google/gemini-flash-1.5-free` model
+
+### 3. Create GitHub Repository
+
+1. Create a new **private** repository on GitHub
+2. Push these files to the repository:
+   ```bash
+   git init
+   git add .
+   git commit -m "Initial commit: Amazon price tracker"
+   git branch -M main
+   git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
+   git push -u origin main
+   ```
+
+### 4. Configure GitHub Secrets
+
+Go to your repository: **Settings → Secrets and variables → Actions → New repository secret**
+
+Add these **4 secrets**:
+
+| Secret Name | Value | Description |
+|-------------|-------|-------------|
+| `AMAZON_URL` | `https://www.amazon.in/dp/B0XXXXXXXX` | Full Amazon India product URL |
+| `OPENROUTER_API_KEY` | `sk-or-v1-xxxxxxxxxxxxx` | Your OpenRouter API key |
+| `TELEGRAM_BOT_TOKEN` | `123456789:ABCdefGHIjklMNOpqrSTUvwxyz` | From BotFather |
+| `TELEGRAM_CHAT_ID` | `123456789` | Your numeric chat ID |
+
+### 5. Enable GitHub Actions
+
+1. Go to **Actions** tab in your repository
+2. Click "I understand my workflows, go ahead and enable them"
+3. The workflow will run automatically every 4 hours
+4. You can also trigger manually from Actions tab → "Run workflow"
+
+### 6. Test the Setup
+
+1. Go to **Actions** tab
+2. Select "Amazon Price Tracker" workflow
+3. Click "Run workflow" → "Run workflow"
+4. Check the run logs for success
+5. Check Telegram for notification (if price is lower than initial state)
+
+## Customization
+
+### Change Check Frequency
+
+Edit `.github/workflows/tracker.yml`:
+
+```yaml
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours instead of 4
+```
+
+### Track Multiple Products
+
+Create separate workflow files or modify `index.js` to accept multiple URLs via environment variables.
+
+### Add Price History Report
+
+The `state.json` accumulates `priceHistory` array. You can:
+- Add a step to generate HTML report
+- Deploy to GitHub Pages for visual dashboard
+- Export to CSV for analysis
+
+## Troubleshooting
+
+### "AI could not find price"
+- Amazon may have changed page structure significantly
+- Try increasing HTML segment size in `extractHtmlSegment()` (currently 15000 chars)
+- Check workflow logs for the HTML segment being sent
+
+### "Telegram API error: 400 Bad Request"
+- Verify `TELEGRAM_CHAT_ID` is correct (numeric, no quotes)
+- Ensure you've messaged the bot at least once
+
+### "Git push failed"
+- Ensure repository is not empty
+- Check `GITHUB_TOKEN` permissions (needs `contents: write`)
+- Workflow uses `actions/checkout@v4` with `fetch-depth: 0`
+
+### Rate Limited by Amazon
+- Increase cron interval to 6+ hours
+- The User-Agent mimics Chrome 120 on Windows
+
+## Security Notes
+
+- All secrets stored in GitHub encrypted secrets (never in code)
+- `state.json` only contains price data, no credentials
+- GitHub Actions runs in isolated ephemeral runners
+- OpenRouter free tier has daily limits (check their docs)
+
+## License
+
+MIT License - Feel free to use and modify.

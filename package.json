@@ -1,0 +1,16 @@
+{
+  "name": "amazon-price-tracker",
+  "version": "1.0.0",
+  "description": "Automated Amazon India price tracker with AI parsing",
+  "main": "index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"No tests specified\" && exit 0"
+  },
+  "keywords": ["price-tracker", "amazon", "automation", "github-actions"],
+  "license": "MIT"
+}
