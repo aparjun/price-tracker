@@ -1,0 +1,284 @@
+/* =========================================================================
+ * Price Tracker — Web Admin UI (static, GitHub Pages)
+ *
+ * Architecture (Option A):
+ *  - "Sign in with Google" (Google Identity Services) gates access by checking
+ *    the signed-in email against CONFIG.ALLOWED_EMAILS. It is a soft gate:
+ *    the real write authorization is the GitHub PAT entered below.
+ *  - Product data lives in products.json (in the repo). Reads/writes go through
+ *    the GitHub REST Contents API. Nothing server-side; no secrets in the site.
+ * ======================================================================= */
+
+const CONFIG = {
+  // 1) Create an OAuth 2.0 Client ID (Web application) in Google Cloud Console.
+  //    Add the Pages origin (e.g. https://aparjun.github.io) to "Authorized JS origins".
+  GOOGLE_CLIENT_ID: 'YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com',
+
+  // 2) List the Google account email(s) allowed to use this page.
+  ALLOWED_EMAILS: ['you@gmail.com'],
+
+  // 3) Where products.json lives.
+  REPO_OWNER: 'aparjun',
+  REPO_NAME: 'price-tracker',
+  BRANCH: 'dev',
+  PRODUCTS_PATH: 'products.json',
+  STATE_PATH: 'state.json'
+};
+
+const HIGH_INITIAL = 999999999;
+
+/* ----------------------------- small helpers ---------------------------- */
+const byId = (id) => document.getElementById(id);
+
+function setMsg(id, text, kind) {
+  const el = byId(id);
+  el.textContent = text;
+  el.className = 'message' + (kind ? ' ' + kind : '');
+}
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function slugify(s) {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function decodeBase64(b64) {
+  const bin = atob(b64.replace(/\s/g, ''));
+  return decodeURIComponent(escape(bin));
+}
+function encodeBase64(str) {
+  return btoa(unescape(encodeURIComponent(str)));
+}
+
+/* --------------------------- Google sign-in ----------------------------- */
+function parseJwt(token) {
+  const base64Url = token.split('.')[1];
+  const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+  return JSON.parse(decodeURIComponent(atob(base64).split('').map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('')));
+}
+
+function verifyCredential(credential) {
+  const p = parseJwt(credential);
+  const now = Math.floor(Date.now() / 1000);
+  if (p.aud !== CONFIG.GOOGLE_CLIENT_ID) throw new Error('Token audience mismatch');
+  if (p.iss !== 'accounts.google.com' && p.iss !== 'https://accounts.google.com') throw new Error('Bad issuer');
+  if (p.exp < now) throw new Error('Token expired');
+  if (!CONFIG.ALLOWED_EMAILS.includes(p.email)) throw new Error('Email not allowed: ' + p.email);
+  return p;
+}
+
+function handleCredential(response) {
+  try {
+    const payload = verifyCredential(response.credential);
+    sessionStorage.setItem('email', payload.email);
+    onSignIn(payload.email);
+  } catch (e) {
+    alert('Sign-in failed: ' + e.message);
+  }
+}
+
+function onSignIn(email) {
+  byId('app').classList.remove('hidden');
+  byId('g_id_button').classList.add('hidden');
+  byId('signout-btn').classList.remove('hidden');
+  byId('user-label').textContent = 'Signed in as ' + email;
+  byId('user-label').classList.remove('hidden');
+  loadDashboard();
+}
+
+function signOut() {
+  sessionStorage.removeItem('email');
+  location.reload();
+}
+
+/* ----------------------------- GitHub API ------------------------------- */
+async function ghFetch(path, options = {}) {
+  const headers = { Accept: 'application/vnd.github+json', ...(options.headers || {}) };
+  const pat = localStorage.getItem('pat');
+  if (pat) headers.Authorization = 'Bearer ' + pat;
+  const res = await fetch('https://api.github.com' + path, { ...options, headers });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    let detail = '';
+    try {
+      const j = JSON.parse(text);
+      detail = j.message || '';
+    } catch (_) {}
+    throw new Error(`GitHub ${res.status} ${detail}`.trim());
+  }
+  return res;
+}
+
+async function getFile(path) {
+  const res = await ghFetch(`/repos/${CONFIG.REPO_OWNER}/${CONFIG.REPO_NAME}/contents/${path}?ref=${CONFIG.BRANCH}`);
+  const data = await res.json();
+  return { content: JSON.parse(decodeBase64(data.content)), sha: data.sha };
+}
+
+async function putFile(path, obj, sha, message) {
+  const body = {
+    message,
+    content: encodeBase64(JSON.stringify(obj, null, 2)),
+    branch: CONFIG.BRANCH
+  };
+  if (sha) body.sha = sha;
+  const res = await ghFetch(`/repos/${CONFIG.REPO_OWNER}/${CONFIG.REPO_NAME}/contents/${path}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return res.json();
+}
+
+/* ------------------------------- PAT UI ---------------------------------- */
+function savePat() {
+  const v = byId('pat').value.trim();
+  if (!v) {
+    setMsg('pat-status', 'Enter a token.', 'error');
+    return;
+  }
+  localStorage.setItem('pat', v);
+  setMsg('pat-status', 'Token saved in this browser.', 'success');
+  byId('pat').value = '';
+}
+function clearPat() {
+  localStorage.removeItem('pat');
+  setMsg('pat-status', 'Token cleared.', 'success');
+}
+function prefillPat() {
+  if (localStorage.getItem('pat')) setMsg('pat-status', 'Token loaded from this browser.', 'success');
+}
+
+/* ----------------------------- Dashboard -------------------------------- */
+async function loadDashboard() {
+  setMsg('dash-msg', 'Loading...');
+  try {
+    const { content: products } = await getFile(CONFIG.PRODUCTS_PATH);
+    let state = {};
+    try {
+      const s = await getFile(CONFIG.STATE_PATH);
+      state = s.content.products || {};
+    } catch (_) {
+      /* state.json may not exist yet on a fresh repo */
+    }
+
+    const tbody = byId('products-body');
+    tbody.innerHTML = '';
+    if (products.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="muted">No products tracked yet.</td></tr>';
+    }
+
+    products.forEach((p) => {
+      const st = state[p.id] || {};
+      const low = st.lowestPrice && st.lowestPrice < HIGH_INITIAL ? '₹' + st.lowestPrice.toLocaleString('en-IN') : '—';
+      const last = st.lastChecked ? new Date(st.lastChecked).toLocaleString() : '—';
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td>${esc(p.name)}</td>` +
+        `<td>${esc(p.id)}</td>` +
+        `<td>${low}</td>` +
+        `<td>${esc(last)}</td>` +
+        `<td><a href="${esc(p.url)}" target="_blank" rel="noopener">open</a></td>` +
+        `<td><button type="button" onclick="deleteProduct('${esc(p.id)}')">Delete</button></td>`;
+      tbody.appendChild(tr);
+    });
+
+    setMsg('dash-msg', `${products.length} product(s) tracked.`);
+  } catch (e) {
+    setMsg('dash-msg', 'Error: ' + e.message, 'error');
+  }
+}
+
+/* ---------------------------- Add / Delete ------------------------------ */
+async function addProduct(e) {
+  e.preventDefault();
+  if (!localStorage.getItem('pat')) {
+    setMsg('form-msg', 'Please save your GitHub token first.', 'error');
+    return false;
+  }
+
+  const name = byId('p-name').value.trim();
+  const url = byId('p-url').value.trim();
+  let id = byId('p-id').value.trim();
+
+  if (!/amazon\.in|amazon\.com/.test(url)) {
+    setMsg('form-msg', 'URL must be an Amazon.in or Amazon.com link.', 'error');
+    return false;
+  }
+  if (!id) id = slugify(name) || slugify(url);
+  if (!/^[a-z0-9-]+$/.test(id)) {
+    setMsg('form-msg', 'ID must be lowercase letters/numbers/dashes.', 'error');
+    return false;
+  }
+
+  try {
+    const { content, sha } = await getFile(CONFIG.PRODUCTS_PATH);
+    if (content.some((p) => p.id === id)) {
+      setMsg('form-msg', 'A product with that ID already exists.', 'error');
+      return false;
+    }
+    if (content.some((p) => p.url.toLowerCase() === url.toLowerCase())) {
+      setMsg('form-msg', 'That URL is already tracked.', 'error');
+      return false;
+    }
+    content.push({ id, name, url });
+    await putFile(CONFIG.PRODUCTS_PATH, content, sha, `Add product ${id} via web UI`);
+    setMsg('form-msg', `Added "${name}" ✅`, 'success');
+    byId('add-form').reset();
+    loadDashboard();
+  } catch (err) {
+    setMsg('form-msg', 'Error: ' + err.message, 'error');
+  }
+  return false;
+}
+
+async function deleteProduct(id) {
+  if (!localStorage.getItem('pat')) {
+    setMsg('dash-msg', 'Please save your GitHub token first.', 'error');
+    return;
+  }
+  if (!confirm(`Delete product "${id}"?`)) return;
+  try {
+    const { content, sha } = await getFile(CONFIG.PRODUCTS_PATH);
+    const next = content.filter((p) => p.id !== id);
+    if (next.length === content.length) {
+      setMsg('dash-msg', 'Product not found.', 'error');
+      return;
+    }
+    await putFile(CONFIG.PRODUCTS_PATH, next, sha, `Delete product ${id} via web UI`);
+    setMsg('dash-msg', `Deleted "${id}" ✅`, 'success');
+    loadDashboard();
+  } catch (err) {
+    setMsg('dash-msg', 'Error: ' + err.message, 'error');
+  }
+}
+
+/* ------------------------------- Boot ----------------------------------- */
+window.addEventListener('load', () => {
+  if (!CONFIG.GOOGLE_CLIENT_ID || CONFIG.GOOGLE_CLIENT_ID.includes('YOUR_')) {
+    byId('config-warning').classList.remove('hidden');
+  }
+
+  if (window.google && window.google.accounts && window.google.accounts.id) {
+    window.google.accounts.id.initialize({
+      client_id: CONFIG.GOOGLE_CLIENT_ID,
+      callback: handleCredential
+    });
+    window.google.accounts.id.renderButton(byId('g_id_button'), { theme: 'outline', size: 'medium' });
+  }
+
+  prefillPat();
+
+  const email = sessionStorage.getItem('email');
+  if (email) onSignIn(email);
+});

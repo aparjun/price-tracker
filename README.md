@@ -151,6 +151,47 @@ Add these **3 secrets** (product URLs are NOT secrets):
 4. Check the run logs for success
 5. Check Telegram for notification (the first run reports a new low, since the initial all-time low is effectively infinite)
 
+## Web Admin UI
+
+A static site (in `site/`) deployed to GitHub Pages lets you sign in with Google and
+manage `products.json` without touching git. The tracker itself is unchanged — it
+reads `products.json` from the repo.
+
+### Enable the site
+
+1. In repo **Settings → Pages → Build and deployment**, set Source to **GitHub Actions**.
+2. Push to the `dev` branch (the `pages.yml` workflow deploys `site/` automatically).
+3. The site URL is `https://<user>.github.io/<repo>/` (e.g. `https://aparjun.github.io/price-tracker/`).
+
+### Google sign-in (gate)
+
+1. In [Google Cloud Console](https://console.cloud.google.com) create an **OAuth 2.0 Client ID** (Web application).
+2. Under **Authorized JavaScript origins** add your Pages origin, e.g. `https://aparjun.github.io`.
+3. Put the Client ID and your Google email(s) into `site/app.js` → `CONFIG` (`GOOGLE_CLIENT_ID`, `ALLOWED_EMAILS`).
+4. The sign-in is a soft gate: it only checks the signed-in email is allowed. Actual write
+   access comes from the GitHub token below, so the email check is convenience, not real security.
+
+### GitHub token (write access)
+
+In the site, paste a GitHub token once (stored only in your browser via `localStorage`):
+
+- **Fine-grained PAT**: grant **Contents: Read and write** on this repo, **or**
+- **Classic PAT**: grant the `public_repo` scope (enough because the repo is public).
+
+The site uses it to read/write `products.json` (and read `state.json` for the dashboard).
+
+### Usage
+
+- **Add product**: fill name + Amazon URL; the ID auto-fills from the name (editable, must be unique).
+- **Dashboard**: lists each product with its all-time low and last-checked time (from `state.json`).
+- **Delete**: removes a product from `products.json`.
+
+> ⚠️ **Automation note**: GitHub runs *scheduled* workflows from the **default branch**.
+> All code (including `tracker.yml`) currently lives on `dev`, and the default branch is `master`
+> (which only has the plan). So the 4-hour automation will **not** fire until the default
+> branch is set to `dev` (Settings → Branches → default branch → `dev`), or `dev` is merged into
+> `master`. The manual "Run workflow" trigger already works on `dev`.
+
 ## Customization
 
 ### Change Check Frequency

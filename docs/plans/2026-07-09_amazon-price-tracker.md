@@ -695,3 +695,10 @@ After implementation, verify:
 - Product URLs moved out of secrets into a committed `products.json` (they are public, not sensitive). Only 3 secrets remain: `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
 - **Free-model enforcement**: before any AI call, resolve models via OpenRouter `/models`, keep only those with `pricing.prompt === "0"` AND `pricing.completion === "0"` AND id ending in `:free`. Fall back to a curated `:free` list if the API is unreachable. A guard refuses to call any non-`:free` model so credits are never consumed.
 - **Resilience**: every external step has retry-with-backoff plus fallback — Amazon fetch rotates User-Agents and treats 404 as fatal; AI parse retries each model 2x then falls back to the next free model; Telegram alerts retry 3x; state write retries 3x. All calls have timeouts. A single product failure alerts and continues; the run only fails if all products fail.
+
+## Addendum 2 (Web Admin UI)
+
+- Added a static site in `site/` deployed via GitHub Pages (`pages.yml`).
+- Option A chosen: Google sign-in (GIS) gates access by allowed email; a GitHub PAT (stored in browser) reads/writes `products.json` via the Contents API. Tracker script unchanged.
+- `site/app.js` `CONFIG` holds Google Client ID, allowed emails, repo owner/name, and target branch (dev).
+- Reminder: scheduled workflow runs from the default branch; default must be set to `dev` (or dev merged to master) for the 4-hour automation to fire.
