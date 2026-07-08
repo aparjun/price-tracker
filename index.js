@@ -26,6 +26,11 @@ const PREFERRED_FREE_MODELS = [
   'google/gemma-4-31b-it:free'
 ];
 
+// Fallback provider (only used when OpenRouter free models are unavailable).
+// Mistral has a free tier (small quota); kept as a sparing backup so OpenRouter
+// (zero-cost) remains the primary parser.
+const MISTRAL_MODEL = 'mistral-small-latest';
+
 // A few realistic User-Agents, rotated on retries to reduce Amazon blocking.
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -256,16 +261,9 @@ function extractHtmlSegment(html) {
   return segment;
 }
 
-// Call a single (verified-free) model to extract the price.
-async function callModel(modelId, htmlSegment) {
-  // Defense-in-depth: never call a model that isn't explicitly free.
-  if (!modelId.endsWith(':free')) {
-    throw new FatalError(`Refusing to call non-free model "${modelId}" (would consume credits)`);
-  }
-
-  console.log(`🤖 Parsing price with ${modelId}...`);
-
-  const prompt = `Extract the current selling price in INR (Indian Rupees) from this Amazon product page HTML snippet.
+// Shared prompt: ask the model for the current INR selling price only.
+function buildPricePrompt(htmlSegment) {
+  return `Extract the current selling price in INR (Indian Rupees) from this Amazon product page HTML snippet.
 
 Rules:
 - Return ONLY the numeric price value (e.g., "42999" or "42999.00")
@@ -277,6 +275,18 @@ Rules:
 
 HTML:
 ${htmlSegment}`;
+}
+
+// Call a single (verified-free) model to extract the price.
+async function callModel(modelId, htmlSegment) {
+  // Defense-in-depth: never call a model that isn't explicitly free.
+  if (!modelId.endsWith(':free')) {
+    throw new FatalError(`Refusing to call non-free model "${modelId}" (would consume credits)`);
+  }
+
+  console.log(`🤖 Parsing price with ${modelId}...`);
+
+  const prompt = buildPricePrompt(htmlSegment);
 
   const res = await fetchWithTimeout(
     'https://openrouter.ai/api/v1/chat/completions',
@@ -326,30 +336,93 @@ ${htmlSegment}`;
 }
 
 // Try each free model in order; fall back to the next on any failure.
-// Try only the first few free models (never all 24 — cascading burns the
-// free-tier rate limit and triggers mass 429s). Stop immediately on a
-// rate-limit (429) since it's account-wide and won't clear mid-run.
+// Mistral fallback: used only when OpenRouter free models are exhausted/
+// rate-limited. Requires MISTRAL_API_KEY (optional repo secret). Mistral has
+// a free tier (small quota) — used sparingly, so OpenRouter stays primary.
+async function callMistral(apiKey, htmlSegment) {
+  console.log(`🤖 Parsing price with Mistral (${MISTRAL_MODEL})...`);
+  const prompt = buildPricePrompt(htmlSegment);
+
+  const res = await fetchWithTimeout('https://api.mistral.ai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: MISTRAL_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 50,
+      temperature: 0
+    })
+  }, 60000);
+
+  if (!res.ok) {
+    if (res.status === 429) throw new RateLimitedError('Mistral HTTP 429 (rate limit)');
+    if (res.status >= 500) throw new Error(`Mistral HTTP ${res.status} (transient)`);
+    throw new FatalError(`Mistral HTTP ${res.status}: ${res.statusText}`);
+  }
+
+  const data = await res.json();
+  if (data?.error) throw new Error(`Mistral error: ${data.error.message || JSON.stringify(data.error)}`);
+
+  const content = data?.choices?.[0]?.message?.content?.trim() || '';
+  console.log(`🤖 Mistral Response: "${content}"`);
+
+  if (content === 'NOT_FOUND' || !content) throw new FatalError('Mistral could not find price in HTML');
+  const numericPrice = parseFloat(content.replace(/[^0-9.]/g, ''));
+  if (isNaN(numericPrice) || numericPrice <= 0) throw new FatalError(`Invalid price extracted: ${content}`);
+
+  console.log(`💰 Parsed price: ₹${numericPrice.toLocaleString('en-IN')}`);
+  return numericPrice;
+}
+
+// OpenRouter free models first (max 3), then a single Mistral fallback.
+// Capped at ~3 + 1 calls so we never storm the APIs.
 async function parsePriceWithFallback(htmlSegment, freeModelIds) {
   const candidates = freeModelIds.slice(0, 3);
   let lastError;
+  let rateLimited = false;
+
   for (const modelId of candidates) {
     try {
       const price = await withRetry(
         () => callModel(modelId, htmlSegment),
-        { retries: 2, baseDelayMs: 1500, label: `AI parse (${modelId})`, isRetryable: (e) => !e?.fatal && !e?.rateLimited }
+        { retries: 1, baseDelayMs: 1500, label: `AI parse (${modelId})`, isRetryable: (e) => !e?.fatal && !e?.rateLimited }
       );
-      console.log(`💡 Used model ${modelId}`);
+      console.log(`💡 Used OpenRouter model ${modelId}`);
       return price;
     } catch (err) {
-      if (err?.rateLimited) {
-        throw new RateLimitedError('OpenRouter free tier rate-limited. Will retry next scheduled run.');
-      }
+      if (err?.rateLimited) rateLimited = true;
       lastError = err;
-      const reason = err?.fatal ? 'could not parse price' : 'failed (transient)';
-      console.warn(`⚠️  Model ${modelId} ${reason}; trying next model`);
+      const reason = err?.fatal ? 'could not parse price' : err?.rateLimited ? 'rate-limited' : 'failed (transient)';
+      console.warn(`⚠️  OpenRouter ${modelId} ${reason}; trying next`);
     }
   }
-  throw lastError ?? new FatalError('All free models failed to parse price');
+
+  const mistralKey = process.env.MISTRAL_API_KEY;
+  if (mistralKey) {
+    try {
+      console.log('🔁 Falling back to Mistral...');
+      const price = await withRetry(
+        () => callMistral(mistralKey, htmlSegment),
+        { retries: 1, baseDelayMs: 1500, label: 'AI parse (Mistral)', isRetryable: (e) => !e?.fatal && !e?.rateLimited }
+      );
+      console.log('💡 Used Mistral fallback');
+      return price;
+    } catch (err) {
+      if (err?.rateLimited) rateLimited = true;
+      lastError = err;
+      console.warn(`⚠️  Mistral fallback failed: ${err.message}`);
+    }
+  } else {
+    console.log('ℹ️  MISTRAL_API_KEY not set; skipping Mistral fallback');
+  }
+
+  if (rateLimited) {
+    throw new RateLimitedError('All providers rate-limited. Will retry next scheduled run.');
+  }
+  throw lastError ?? new FatalError('All providers failed to parse price');
 }
 
 // Send a Telegram message (throws on failure so the caller can retry).

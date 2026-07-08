@@ -708,3 +708,8 @@ After implementation, verify:
 - GitHub *secrets/variables* are only available to Actions runners, NOT to browser JS on a static Pages site. So values can't be read directly by `app.js`.
 - Implemented build-time injection: `pages.yml` reads repo **Variables** (`GOOGLE_CLIENT_ID`, `ALLOWED_EMAILS`, `REPO_OWNER`, `REPO_NAME`, `BRANCH`) and writes `site/config.js`, which overrides `CONFIG_DEFAULTS` in `app.js` via `window.APP_CONFIG`.
 - These values are public by nature → use Variables, not Secrets. The GitHub PAT must never be a var/secret (would be exposed in the public site); it stays in the browser.
+
+## Addendum 4 (Mistral fallback)
+
+- Added an optional Mistral AI fallback used only when OpenRouter free models are exhausted/rate-limited. Implemented `callMistral()` and `buildPricePrompt()` (shared prompt); `parsePriceWithFallback()` now tries up to 3 OpenRouter free models then one Mistral call (capped ~3+1 requests, no storm).
+- `MISTRAL_API_KEY` is an optional repo **Secret** (not a site Variable). OpenRouter remains the zero-cost primary parser; Mistral is a sparing backup.

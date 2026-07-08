@@ -32,6 +32,8 @@ final defense-in-depth guard refuses to call any model that does not end with
 | Telegram alert | Retry up to 3x; failures also reported via error alert |
 | Write state | Retry up to 3x |
 
+**Optional Mistral fallback:** if OpenRouter's free models are rate-limited, the script falls back to **Mistral AI** (set the `MISTRAL_API_KEY` repo secret). Mistral has a free tier (limited quota) and is used only as a sparing backup, so OpenRouter (zero-cost) remains primary.
+
 All external calls use a timeout (Amazon 30s, OpenRouter 60s, Telegram 15s) so a
 hung connection can't stall the run. A failure on one product alerts you and
 continues with the next — the whole run only exits non-zero if every product failed.
