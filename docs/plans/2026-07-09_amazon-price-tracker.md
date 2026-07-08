@@ -702,3 +702,9 @@ After implementation, verify:
 - Option A chosen: Google sign-in (GIS) gates access by allowed email; a GitHub PAT (stored in browser) reads/writes `products.json` via the Contents API. Tracker script unchanged.
 - `site/app.js` `CONFIG` holds Google Client ID, allowed emails, repo owner/name, and target branch (dev).
 - Reminder: scheduled workflow runs from the default branch; default must be set to `dev` (or dev merged to master) for the 4-hour automation to fire.
+
+## Addendum 3 (Configure via GitHub UI)
+
+- GitHub *secrets/variables* are only available to Actions runners, NOT to browser JS on a static Pages site. So values can't be read directly by `app.js`.
+- Implemented build-time injection: `pages.yml` reads repo **Variables** (`GOOGLE_CLIENT_ID`, `ALLOWED_EMAILS`, `REPO_OWNER`, `REPO_NAME`, `BRANCH`) and writes `site/config.js`, which overrides `CONFIG_DEFAULTS` in `app.js` via `window.APP_CONFIG`.
+- These values are public by nature → use Variables, not Secrets. The GitHub PAT must never be a var/secret (would be exposed in the public site); it stays in the browser.

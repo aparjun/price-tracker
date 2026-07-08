@@ -27,6 +27,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Inject non-secret runtime config from GitHub Variables (Settings -> Variables).
+      # The generated site/config.js overrides the defaults in app.js. These values
+      # are public by nature (the site is public), so Variables — not Secrets — is
+      # the correct store. NEVER put the GitHub PAT here; it stays in the browser.
+      - name: Inject runtime config
+        env:
+          CFG_GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID }}
+          CFG_ALLOWED_EMAILS: ${{ vars.ALLOWED_EMAILS }}
+          CFG_REPO_OWNER: ${{ vars.REPO_OWNER }}
+          CFG_REPO_NAME: ${{ vars.REPO_NAME }}
+          CFG_BRANCH: ${{ vars.BRANCH }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const cfg = {
+              GOOGLE_CLIENT_ID: process.env.CFG_GOOGLE_CLIENT_ID || "",
+              ALLOWED_EMAILS: process.env.CFG_ALLOWED_EMAILS ? JSON.parse(process.env.CFG_ALLOWED_EMAILS) : [],
+              REPO_OWNER: process.env.CFG_REPO_OWNER || "",
+              REPO_NAME: process.env.CFG_REPO_NAME || "",
+              BRANCH: process.env.CFG_BRANCH || ""
+            };
+            fs.writeFileSync("site/config.js", "window.APP_CONFIG = " + JSON.stringify(cfg, null, 2) + ";\n");
+            console.log("Wrote site/config.js");
+          '
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 

@@ -163,6 +163,27 @@ reads `products.json` from the repo.
 2. Push to the `dev` branch (the `pages.yml` workflow deploys `site/` automatically).
 3. The site URL is `https://<user>.github.io/<repo>/` (e.g. `https://aparjun.github.io/price-tracker/`).
 
+### Configure via GitHub Variables (no code edits)
+
+Instead of editing `site/app.js`, set these as **Variables** in
+**Settings → Variables → Actions → New repository variable** (they are public by
+nature, so Variables — not Secrets — is the correct store; Secrets work too but hide
+values you'll want to re-edit):
+
+| Variable | Value | Notes |
+|----------|-------|-------|
+| `GOOGLE_CLIENT_ID` | `123-.apps.googleusercontent.com` | From the Google OAuth client |
+| `ALLOWED_EMAILS` | `["you@gmail.com"]` | JSON array of allowed Google emails |
+| `REPO_OWNER` | `aparjun` | |
+| `REPO_NAME` | `price-tracker` | |
+| `BRANCH` | `dev` | Branch `products.json` is read from/written to |
+
+The `pages.yml` deploy workflow reads these and writes `site/config.js`, which
+overrides the defaults in `app.js`. Push to `dev` to redeploy.
+
+> ⚠️ **Never add the GitHub PAT as a variable/secret.** The deploy workflow would
+> bake it into the public site, exposing it to anyone. The PAT stays in your browser.
+
 ### Google sign-in (gate)
 
 1. In [Google Cloud Console](https://console.cloud.google.com) create an **OAuth 2.0 Client ID** (Web application).
