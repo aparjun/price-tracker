@@ -1,0 +1,94 @@
+name: Amazon Price Tracker
+
+on:
+  schedule:
+    # Run every 4 hours (at minute 0 of hours 0, 4, 8, 12, 16, 20)
+    - cron: '0 */4 * * *'
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      force_notification:
+        description: 'Force send notification even if no new low'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  track-price:
+    name: Track Price
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write  # Required to push state.json changes
+
+    steps:
+      # Checkout repository with full history for git push
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed for push
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Setup Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # Install dependencies (if any)
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          elif [ -f package.json ]; then
+            npm install
+          else
+            echo "No package.json found, skipping install"
+          fi
+
+      # Run price tracker
+      - name: Run Price Tracker
+        id: tracker
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          node index.js
+
+      # Commit and push state.json if changed
+      - name: Persist state changes
+        if: always()
+        run: |
+          git config --global user.name 'Price Tracker Bot'
+          git config --global user.email 'price-tracker@github-actions.local'
+
+          # Check if state.json has changes
+          if git diff --quiet state.json; then
+            echo "No changes to state.json"
+          else
+            echo "State file changed, committing..."
+            git add state.json
+            git commit -m "chore: update price tracking state [$(date -u +'%Y-%m-%d %H:%M:%S' UTC)]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "State pushed successfully"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Summary output
+      - name: Output Summary
+        if: always()
+        run: |
+          echo "## Price Tracker Run Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Time**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow**: ${{ github.workflow }}" >> $GITHUB_STEP_SUMMARY
+          if [ -f state.json ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Current State" >> $GITHUB_STEP_SUMMARY
+            cat state.json | jq . >> $GITHUB_STEP_SUMMARY 2>/dev/null || cat state.json >> $GITHUB_STEP_SUMMARY
+          fi

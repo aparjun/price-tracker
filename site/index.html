@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Price Tracker Admin</title>
+  <link rel="stylesheet" href="styles.css" />
+  <!-- Google Identity Services (client-side Google sign-in) -->
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>🧊 Amazon Price Tracker</h1>
+    <div class="auth">
+      <span id="user-label" class="hidden"></span>
+      <div id="g_id_button"></div>
+      <button id="signout-btn" class="hidden" onclick="signOut()">Sign out</button>
+    </div>
+  </header>
+
+  <div id="config-warning" class="banner hidden">
+    ⚠️ Configure <code>CONFIG</code> in <code>app.js</code> (Google Client ID, allowed emails, repo) before this page will work.
+  </div>
+
+  <main id="app" class="hidden">
+    <p class="hint">
+      Add your GitHub token once (stored only in <em>this browser</em>). It is used to commit
+      <code>products.json</code> to the repo. Create a fine-grained PAT with <strong>Contents: Read and write</strong>
+      on this repo, or a classic PAT with the <code>public_repo</code> scope.
+    </p>
+
+    <section class="card">
+      <h2>GitHub token</h2>
+      <div class="row">
+        <input type="password" id="pat" placeholder="ghp_... or github_pat_..." />
+        <button type="button" onclick="savePat()">Save</button>
+        <button type="button" class="ghost" onclick="clearPat()">Clear</button>
+      </div>
+      <p class="message" id="pat-status"></p>
+    </section>
+
+    <section class="card">
+      <h2>Add a product</h2>
+      <form id="add-form" onsubmit="return addProduct(event)">
+        <div class="field">
+          <label for="p-name">Product name</label>
+          <input type="text" id="p-name" placeholder="Samsung 253L Frost Free Double Door" required />
+        </div>
+        <div class="field">
+          <label for="p-url">Amazon URL</label>
+          <input type="url" id="p-url" placeholder="https://www.amazon.in/dp/B0XXXXXXXX" required />
+        </div>
+        <div class="field">
+          <label for="p-id">Product ID <span class="muted">(lowercase, unique)</span></label>
+          <input type="text" id="p-id" placeholder="auto-filled from name — you can edit" />
+        </div>
+        <button type="submit">Add product</button>
+      </form>
+      <p class="message" id="form-msg"></p>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Tracked products</h2>
+        <button type="button" class="ghost" onclick="loadDashboard()">Refresh</button>
+      </div>
+      <table id="products-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>ID</th>
+            <th>All-time low</th>
+            <th>Last checked</th>
+            <th>Link</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="products-body"></tbody>
+      </table>
+      <p class="message" id="dash-msg"></p>
+    </section>
+  </main>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

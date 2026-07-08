@@ -689,3 +689,22 @@ After implementation, verify:
 8. **Cron schedule** - exactly `0 */4 * * *` (every 4 hours at minute 0)
 9. **HTML segment** - exactly 15000 characters from `<body` tag
 10. **Telegram message format** - match the specified format with emoji and locale formatting
+
+## Addendum (2026-07-09 revisions)
+
+- Product URLs moved out of secrets into a committed `products.json` (they are public, not sensitive). Only 3 secrets remain: `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+- **Free-model enforcement**: before any AI call, resolve models via OpenRouter `/models`, keep only those with `pricing.prompt === "0"` AND `pricing.completion === "0"` AND id ending in `:free`. Fall back to a curated `:free` list if the API is unreachable. A guard refuses to call any non-`:free` model so credits are never consumed.
+- **Resilience**: every external step has retry-with-backoff plus fallback — Amazon fetch rotates User-Agents and treats 404 as fatal; AI parse retries each model 2x then falls back to the next free model; Telegram alerts retry 3x; state write retries 3x. All calls have timeouts. A single product failure alerts and continues; the run only fails if all products fail.
+
+## Addendum 2 (Web Admin UI)
+
+- Added a static site in `site/` deployed via GitHub Pages (`pages.yml`).
+- Option A chosen: Google sign-in (GIS) gates access by allowed email; a GitHub PAT (stored in browser) reads/writes `products.json` via the Contents API. Tracker script unchanged.
+- `site/app.js` `CONFIG` holds Google Client ID, allowed emails, repo owner/name, and target branch (dev).
+- Reminder: scheduled workflow runs from the default branch; default must be set to `dev` (or dev merged to master) for the 4-hour automation to fire.
+
+## Addendum 3 (Configure via GitHub UI)
+
+- GitHub *secrets/variables* are only available to Actions runners, NOT to browser JS on a static Pages site. So values can't be read directly by `app.js`.
+- Implemented build-time injection: `pages.yml` reads repo **Variables** (`GOOGLE_CLIENT_ID`, `ALLOWED_EMAILS`, `REPO_OWNER`, `REPO_NAME`, `BRANCH`) and writes `site/config.js`, which overrides `CONFIG_DEFAULTS` in `app.js` via `window.APP_CONFIG`.
+- These values are public by nature → use Variables, not Secrets. The GitHub PAT must never be a var/secret (would be exposed in the public site); it stays in the browser.
