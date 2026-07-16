@@ -2,7 +2,7 @@
   "products": {
     "veg-chopper": {
       "lowestPrice": 169,
-      "lastChecked": "2026-07-15T20:53:45.572Z",
+      "lastChecked": "2026-07-16T06:12:42.750Z",
       "priceHistory": [
         {
           "timestamp": "2026-07-09T02:24:59.286Z",
@@ -86,6 +86,10 @@
         },
         {
           "timestamp": "2026-07-15T20:53:45.572Z",
+          "price": 169
+        },
+        {
+          "timestamp": "2026-07-16T06:12:42.750Z",
           "price": 169
         }
       ]
